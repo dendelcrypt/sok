@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "ERROR on line $LINENO" >&2' ERR
 
 # ---------- helpers ----------
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -24,36 +25,43 @@ ufw_active() {
 
 port_free() {
   local p="$1"
-  ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${p}$"
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${p}$" && return 1
+  return 0
 }
 
 pick_port() {
-  local lo="${1:-20000}" hi="${2:-45000}" p
+  local lo="${1:-20000}" hi="${2:-45000}" p tries=0
   while true; do
-    p="$(shuf -i "${lo}-${hi}" -n 1)"
+    tries=$((tries+1))
+    p="$(shuf -i "${lo}-${hi}" -n 1 2>/dev/null || true)"
+    [[ -n "$p" ]] || die "shuf failed (coreutils missing?)"
     if port_free "$p"; then
       echo "$p"
       return 0
     fi
+    [[ "$tries" -lt 2000 ]] || die "could not find a free port in range ${lo}-${hi}"
   done
 }
 
+# Stable random generators (no tr|head pipe issues)
 rand_user() {
-  echo "u$(tr -dc 'a-z0-9' </dev/urandom | head -c 10)"
+  # u + 10 hex chars => u + [0-9a-f]
+  echo "u$(openssl rand -hex 5)"
 }
 
 rand_pass() {
-  # avoid @ : / % space (often break URL parsing)
-  tr -dc 'A-Za-z0-9_.-' </dev/urandom | head -c 18
+  # 18 chars safe for URLs (A-Za-z0-9_.-)
+  # Take base64, map +/ to _-, strip =, cut 18
+  openssl rand -base64 24 | tr '+/' '_-' | tr -d '=' | cut -c1-18
 }
 
 install_deps() {
-  info "Updating apt & installing build deps..."
+  info "Updating apt & installing deps..."
   apt-get update -y
   apt-get install -y \
     git build-essential make gcc \
     curl ca-certificates \
-    iproute2 procps
+    iproute2 procps coreutils openssl
 }
 
 install_3proxy_from_source() {
@@ -111,9 +119,7 @@ ensure_systemd() {
   local unit="/etc/systemd/system/3proxy.service"
   local bin="/usr/local/bin/3proxy"
 
-  if [[ ! -x "$bin" ]]; then
-    die "3proxy binary not found at $bin"
-  fi
+  [[ -x "$bin" ]] || die "3proxy binary not found at $bin"
 
   info "Creating/updating systemd unit: $unit"
   cat > "$unit" <<EOF
@@ -138,7 +144,6 @@ restart_service() {
   info "Enabling & restarting 3proxy..."
   systemctl enable --now 3proxy
   systemctl restart 3proxy
-  systemctl --no-pager -l status 3proxy || true
 }
 
 open_ufw_ports_if_needed() {
@@ -171,11 +176,9 @@ save_proxies() {
   local out="/root/proxies.txt"
   : > "$out"
   chmod 0600 "$out"
-
   for i in "${!PORTS[@]}"; do
     echo "socks5://${USERS[$i]}:${PASSS[$i]}@${SERVER_IP}:${PORTS[$i]}" >> "$out"
   done
-
   info "Saved: $out (chmod 600)"
 }
 
@@ -188,7 +191,6 @@ IFACE="$(detect_iface)"
 SERVER_IP="$(detect_src_ip)"
 SERVER_IP="${SERVER_IP:-SERVER_IP}"
 
-# Read COUNT from env if provided, else prompt via /dev/tty (works with curl|bash)
 COUNT="${COUNT:-}"
 if [[ -z "$COUNT" ]]; then
   echo ""
@@ -209,7 +211,6 @@ info "Detected server IP (src): ${SERVER_IP}"
 install_deps
 install_3proxy_from_source
 
-# Generate proxies
 declare -a PORTS USERS PASSS
 info "Generating ${COUNT} proxies (free random ports, random creds)..."
 for ((i=0; i<COUNT; i++)); do
@@ -218,13 +219,24 @@ for ((i=0; i<COUNT; i++)); do
   PASSS[$i]="$(rand_pass)"
 done
 
+# Save immediately so you never lose results
+save_proxies
+
 write_cfg
 ensure_systemd
 open_ufw_ports_if_needed
 restart_service
 
 echo ""
-info "Testing proxies locally (curl through 127.0.0.1:PORT -> ifconfig.me)..."
+info "3proxy status:"
+systemctl --no-pager -l status 3proxy || true
+
+echo ""
+info "Listening ports:"
+ss -lntp 2>/dev/null | grep 3proxy || true
+
+echo ""
+info "Testing proxies locally (127.0.0.1:PORT -> ifconfig.me)..."
 ALL_OK=1
 for i in "${!PORTS[@]}"; do
   res="$(test_proxy_local "${PORTS[$i]}" "${USERS[$i]}" "${PASSS[$i]}")"
@@ -237,8 +249,6 @@ for i in "${!PORTS[@]}"; do
   fi
 done
 
-save_proxies
-
 echo ""
 echo "===== RESULT (copy/paste) ====="
 cat /root/proxies.txt
@@ -248,11 +258,12 @@ echo "Notes:"
 echo " - If you use a provider firewall (e.g. Vultr Firewall), open these TCP ports there too."
 echo " - Service logs: journalctl -u 3proxy -n 100 --no-pager"
 echo " - 3proxy log file: /var/log/3proxy/3proxy.log"
-echo ""
 
 if [[ "$ALL_OK" -eq 0 ]]; then
+  echo ""
   echo "Some tests failed. Most common reasons:"
   echo " - Provider firewall blocks ports"
   echo " - Outbound HTTPS is restricted"
   echo " - DNS issues"
 fi
+
