@@ -90,7 +90,6 @@ write_cfg() {
   info "Writing 3proxy config: $cfg"
 
   {
-    echo "daemon"
     echo "nscache 65536"
     echo "timeouts 1 5 30 60 180 1800 15 60"
     echo "log ${logdir}/3proxy.log D"
