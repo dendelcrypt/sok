@@ -169,9 +169,16 @@ need_root
 
 echo ""
 echo "How many SOCKS5 proxies to create on this server? (1-10)"
-read -r -p "> " COUNT
-[[ "$COUNT" =~ ^[0-9]+$ ]] || die "Please enter a number 1-10."
-(( COUNT >= 1 && COUNT <= 10 )) || die "Number must be between 1 and 10."
+read -r COUNT
+
+if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+  die "Please enter a number 1-10."
+fi
+
+if [ "$COUNT" -lt 1 ] || [ "$COUNT" -gt 10 ]; then
+  die "Number must be between 1 and 10."
+fi
+
 
 IFACE="$(detect_iface)"
 [[ -n "$IFACE" ]] || die "Could not detect network interface (ip route)."
